@@ -11,8 +11,6 @@ from rich.live import Live
 from rich import box
 from threading import Thread
 
-
-
 # Initialize rich console
 console = Console()
 
@@ -21,10 +19,13 @@ logging.basicConfig(filename="network_activity.log", level=logging.INFO,
                     format="%(asctime)s - %(message)s", filemode="w")
 
 # Dictionary to store packets count and process information
-packet_stats = defaultdict(lambda: {"count": 0, "pid": None, "process_name": None, "local_port": None, "new": True})
+packet_stats = defaultdict(lambda: {"count": 0, "pid": None, "process_name": None, "local_port": None, "new": True, "last_seen": time.time()})
 
 # Cache for resolving and storing hostnames
 hostname_cache = {}
+
+# Time after which an inactive connection will be removed (in seconds)
+INACTIVITY_TIMEOUT = 60  # Adjust this value as needed
 
 def resolve_hostname(ip):
     if ip not in hostname_cache:
@@ -66,10 +67,19 @@ def update_packet_stats(packet):
             if key not in packet_stats:
                 packet_stats[key]["new"] = True
                 logging.info(f"New connection: {src_hostname}:{sport} -> {dst_hostname}, PID: {pid}, Process: {process_name}")
+            
+            # Update the packet stats
             packet_stats[key]["count"] += 1
             packet_stats[key]["pid"] = pid
             packet_stats[key]["process_name"] = process_name
             packet_stats[key]["local_port"] = sport
+            packet_stats[key]["last_seen"] = time.time()
+
+def remove_inactive_connections():
+    current_time = time.time()
+    keys_to_remove = [key for key, value in packet_stats.items() if current_time - value["last_seen"] > INACTIVITY_TIMEOUT]
+    for key in keys_to_remove:
+        del packet_stats[key]
 
 def create_packet_stats_table():
     table = Table(title="Network Activity Monitor", box=box.SQUARE)
@@ -111,7 +121,7 @@ def main():
     if 0 <= choice < len(available_interfaces):
         interface = available_interfaces[choice]
         console.print(f"Monitoring interface: [bold magenta]{interface}[/bold magenta]")
-        os.system("cls") #clear cmd screen
+        os.system("cls")
         # Start the packet sniffer in a separate thread
         sniffer_thread = Thread(target=packet_sniffer, args=(interface,))
         sniffer_thread.start()
@@ -119,6 +129,7 @@ def main():
         try:
             with Live(create_packet_stats_table(), refresh_per_second=1, console=console) as live:
                 while True:
+                    remove_inactive_connections()  # Remove old connections before updating the table
                     live.update(create_packet_stats_table())
                     time.sleep(1)
         except KeyboardInterrupt:
