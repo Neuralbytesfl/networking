@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.live import Live
 from rich import box
-from threading import Thread
+from threading import Thread, Event
 
 # Initialize rich console
 console = Console()
@@ -27,6 +27,9 @@ hostname_cache = {}
 # Time after which an inactive connection will be removed (in seconds)
 INACTIVITY_TIMEOUT = 60  # Adjust this value as needed
 
+# Event to stop the packet sniffer thread
+stop_event = Event()
+
 def resolve_hostname(ip):
     if ip not in hostname_cache:
         try:
@@ -37,43 +40,49 @@ def resolve_hostname(ip):
     return hostname_cache[ip]
 
 def get_process_info(ip, port):
-    for conn in psutil.net_connections(kind='inet'):
-        if conn.laddr.ip == ip and conn.laddr.port == port:
-            return conn.pid
+    try:
+        for conn in psutil.net_connections(kind='inet'):
+            if conn.laddr.ip == ip and conn.laddr.port == port:
+                return conn.pid
+    except psutil.AccessDenied:
+        return None
     return None
 
 def update_packet_stats(packet):
-    if packet.haslayer(scapy.IP):
-        src_ip = packet[scapy.IP].src
-        dst_ip = packet[scapy.IP].dst
-        protocol = packet[scapy.IP].proto
+    try:
+        if packet.haslayer(scapy.IP):
+            src_ip = packet[scapy.IP].src
+            dst_ip = packet[scapy.IP].dst
+            protocol = packet[scapy.IP].proto
 
-        # Resolve hostnames
-        src_hostname = resolve_hostname(src_ip)
-        dst_hostname = resolve_hostname(dst_ip)
+            # Resolve hostnames
+            src_hostname = resolve_hostname(src_ip)
+            dst_hostname = resolve_hostname(dst_ip)
 
-        # Assume TCP/UDP packets, try to retrieve port numbers and use them
-        sport = packet[scapy.TCP].sport if protocol == 6 else packet[scapy.UDP].sport if protocol == 17 else None
-        dport = packet[scapy.TCP].dport if protocol == 6 else packet[scapy.UDP].dport if protocol == 17 else None
+            # Assume TCP/UDP packets, try to retrieve port numbers and use them
+            sport = packet[scapy.TCP].sport if protocol == 6 else packet[scapy.UDP].sport if protocol == 17 else None
+            dport = packet[scapy.TCP].dport if protocol == 6 else packet[scapy.UDP].dport if protocol == 17 else None
 
-        if sport is not None:
-            pid = get_process_info(src_ip, sport)
-            if pid is None and dport is not None:
-                pid = get_process_info(dst_ip, dport)
-            
-            process_name = psutil.Process(pid).name() if pid else "Unknown"
-            
-            key = (src_hostname, dst_hostname, pid, sport)
-            if key not in packet_stats:
-                packet_stats[key]["new"] = True
-                logging.info(f"New connection: {src_hostname}:{sport} -> {dst_hostname}, PID: {pid}, Process: {process_name}")
-            
-            # Update the packet stats
-            packet_stats[key]["count"] += 1
-            packet_stats[key]["pid"] = pid
-            packet_stats[key]["process_name"] = process_name
-            packet_stats[key]["local_port"] = sport
-            packet_stats[key]["last_seen"] = time.time()
+            if sport is not None:
+                pid = get_process_info(src_ip, sport)
+                if pid is None and dport is not None:
+                    pid = get_process_info(dst_ip, dport)
+                
+                process_name = psutil.Process(pid).name() if pid else "Unknown"
+                
+                key = (src_hostname, dst_hostname, pid, sport)
+                if key not in packet_stats:
+                    packet_stats[key]["new"] = True
+                    logging.info(f"New connection: {src_hostname}:{sport} -> {dst_hostname}, PID: {pid}, Process: {process_name}")
+                
+                # Update the packet stats
+                packet_stats[key]["count"] += 1
+                packet_stats[key]["pid"] = pid
+                packet_stats[key]["process_name"] = process_name
+                packet_stats[key]["local_port"] = sport
+                packet_stats[key]["last_seen"] = time.time()
+    except Exception as e:
+        logging.error(f"Error updating packet stats: {e}")
 
 def remove_inactive_connections():
     current_time = time.time()
@@ -103,9 +112,11 @@ def create_packet_stats_table():
 
 def packet_sniffer(interface):
     try:
-        scapy.sniff(iface=interface, prn=update_packet_stats, store=False)
+        scapy.sniff(iface=interface, prn=update_packet_stats, store=False, stop_filter=lambda x: stop_event.is_set())
     except PermissionError:
         console.print("[bold red]You need to run this script as an administrator or root.[/bold red]")
+    except Exception as e:
+        logging.error(f"Error in packet sniffer: {e}")
 
 def list_interfaces():
     interfaces = psutil.net_if_addrs()
@@ -134,6 +145,7 @@ def main():
                     time.sleep(1)
         except KeyboardInterrupt:
             console.print("\n[bold red]Stopping packet sniffer...[/bold red]")
+            stop_event.set()
             sniffer_thread.join()
             console.print("[bold green]Done.[/bold green]")
     else:
